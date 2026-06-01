@@ -1,4 +1,4 @@
-from .manager import HydroWireManager
+from ..manager import HydroWireManager
 class PWM:
     """
         Basic pwm interface for rov components

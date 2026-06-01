@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hydrowire"
-version = "0.0.9"
+version = "0.0.10"
 description = "Python library for applications to interact with ROV (Remotely Operated Vehicle) systems over WebSocket"
 readme = "README.md"
 requires-python = ">=3.9"

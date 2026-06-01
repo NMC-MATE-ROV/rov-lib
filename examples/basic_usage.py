@@ -43,7 +43,9 @@ async def main():
         # print(f"Led response: {response}")
         # Sends: {"device": "led", "cmd": "pwm", "params": {"duty_cycle": 0.5}}
         while True:
-            input()
+            key = input()
+            if key == 'q':
+                break
             led = LED(
                     name="led",
                     manager=manager,

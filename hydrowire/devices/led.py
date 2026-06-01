@@ -1,5 +1,5 @@
 from typing import Optional, Dict, Any
-from .manager import HydroWireManager
+from ..manager import HydroWireManager
 
 class LED:
     """
