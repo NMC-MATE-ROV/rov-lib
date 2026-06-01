@@ -66,3 +66,17 @@ Where to look next
 
 ---
 If you want this expanded to include recommended linters / formatters or a troubleshooting checklist (test failures, common pitfalls when mocking websockets), say which area to cover and Copilot will add it.
+
+---
+Suggested improvements for Copilot sessions
+
+- Python & environment: Project supports Python 3.9–3.13 (see pyproject.toml). Use a venv and install dev extras: pip install -e ".[dev]".
+- Running tests: CI-style quick run: pytest -q. Run a single test: pytest tests/test_client.py::test_send_command_with_device_id -q
+- Key files to inspect: hydrowire/client.py, hydrowire/manager.py, tests/*.py, pyproject.toml, .github/workflows/*
+- Command shape & lifecycle: Preserve the command JSON shape (action -> cmd, params grouping) and call HydroWireManager.initialize() before sending commands.
+- Tests: Tests create ephemeral websockets servers on localhost (ports 8765, 8766). Keep tests deterministic by binding to explicit ports or using fixtures.
+- CI & publishing: .github/workflows/ci.yml runs pytest -q; publishing uses python -m build and twine check dist/*.
+- AI assistant configs found: .github/copilot-instructions.md (this file). No CLAUDE.md, .cursorrules, AGENTS.md, or other common AI assistant config files detected.
+
+---
+If you'd like these suggestions folded into the top sections, or want additional checks (linters, coverage, or troubleshooting steps), say which and Copilot will update the file.
