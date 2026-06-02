@@ -24,8 +24,13 @@ class WebSocketCommandClient:
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
 
     async def connect(self) -> None:
-        if self._ws is None:
-            self._ws = await websockets.connect(self.uri)
+        while self._ws is None:
+            try:
+                self._ws = await websockets.connect(self.uri)
+            except Exception as e:
+                print("websocket does not exist, ensure device is connected to network")
+                print("Waiting 5 seconds before reattempting connection")
+                await asyncio.sleep(5)
 
     async def close(self) -> None:
         if self._ws is not None:

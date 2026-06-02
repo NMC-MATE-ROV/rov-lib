@@ -85,12 +85,13 @@ class HydroWireManager:
             await self._start_gui(gui_callable=gui_callable, gui_stop_callable=gui_stop_callable, **gui_config)
 
     async def _start_gui(self, gui_callable: Optional[Callable] = None, gui_stop_callable: Optional[Callable] = None, **config) -> None:
-        """Start GUI in a background thread so it doesn't block asyncio loop.
+        """Start GUI in a separate process so it doesn't interfere with the asyncio loop or Qt's
+        requirement that GUI objects live in a single native thread.
 
-        Stores references to the thread and stop callable to allow graceful
+        Stores references to the process and stop callable to allow graceful
         shutdown in close().
         """
-        import threading
+        import multiprocessing
 
         stop_callable = gui_stop_callable
 
@@ -103,17 +104,15 @@ class HydroWireManager:
                 print(f"Unable to import basic GUI: {e}. Skipping GUI startup.")
                 return
 
-        def _runner():
-            try:
-                gui_callable(**config)
-            except Exception as e:
-                print(f"GUI exited with exception: {e}")
-
-        thread = threading.Thread(target=_runner, daemon=False)
-        thread.start()
+        # Run the GUI callable directly in the child process. Passing a
+        # nested function as the Process target causes pickling errors on
+        # platforms using the 'spawn' start method (e.g., Windows). Use the
+        # top-level callable or pass kwargs directly instead.
+        process = multiprocessing.Process(target=gui_callable, kwargs=config, daemon=True)
+        process.start()
 
         # store references for shutdown
-        self._gui_thread = thread
+        self._gui_process = process
         self._gui_stop_callable = stop_callable
 
     async def run(self, gui_enabled: bool = False, gui_callable: Optional[Callable] = None, gui_stop_callable: Optional[Callable] = None, **gui_config) -> None:
@@ -141,15 +140,32 @@ class HydroWireManager:
                         stopped = True
                     except Exception:
                         stopped = False
+
                 if stopped:
-                    # join the thread (with timeout) to wait for it to exit
-                    if hasattr(self, "_gui_thread") and self._gui_thread is not None:
+                    # join the process (with timeout) to wait for it to exit
+                    if hasattr(self, "_gui_process") and self._gui_process is not None:
                         try:
-                            await asyncio.to_thread(self._gui_thread.join, 5)
+                            await asyncio.to_thread(self._gui_process.join, 5)
                         except Exception as e:
-                            print(f"Error joining GUI thread: {e}")
+                            print(f"Error joining GUI process: {e}")
+                else:
+                    # If the stop callable didn't stop the GUI, attempt to terminate the process
+                    if hasattr(self, "_gui_process") and self._gui_process is not None:
+                        try:
+                            self._gui_process.terminate()
+                            await asyncio.to_thread(self._gui_process.join, 5)
+                        except Exception as e:
+                            print(f"Error terminating GUI process: {e}")
             except Exception as e:
                 print(f"Error while stopping GUI: {e}")
+
+        # If we have a process but no stop callable, try terminating it directly
+        elif hasattr(self, "_gui_process") and self._gui_process is not None:
+            try:
+                self._gui_process.terminate()
+                await asyncio.to_thread(self._gui_process.join, 5)
+            except Exception as e:
+                print(f"Error terminating GUI process: {e}")
 
         if self.client:
             await self.client.close()

@@ -14,7 +14,9 @@ async def main():
     manager = ROVManager("ws://rov-pi:3000/ws")
 
     # Start the library (initialize communication)
-    await manager.start()
+    await manager.start(
+            gui_enabled=True
+    )
 
     try:
         # Example 1: Send command to LED device
