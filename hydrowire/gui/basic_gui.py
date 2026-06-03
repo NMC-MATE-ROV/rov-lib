@@ -1,56 +1,89 @@
 from PySide6.QtWidgets import QApplication, QLabel, QWidget, QVBoxLayout
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from typing import Dict, Any
-from ..manager import get_manager, HydroWireManager
+from qasync import QEventLoop
+from ..client import WebSocketCommandClient
 import asyncio
 
-async def run_basic_gui(**config):
+
+def run_basic_gui(**config):
+    """Run a very small GUI and refresh the displayed uptime periodically.
+
+    Prefers qasync integration when available so asyncio coroutines run
+    inside the Qt event loop. If qasync is not installed, falls back to a
+    simple approach that opens a fresh asyncio loop for each update tick.
+    """
+
     app = QApplication.instance()
     own_app = app is None
     if own_app:
         app = QApplication([])
 
-    manager = await get_manager()
+    manager_uri = config.get("manager_uri") or config.get("uri")
+    interval = int(config.get("interval_ms", 200))
 
-    stats = {}
-    if manager is None:
-        # Manager not available in this process (GUI likely running in child process).
-        # If a manager URI was provided in config, create a temporary client to fetch stats.
-        manager_uri = config.get("manager_uri") or config.get("uri")
-        if manager_uri:
-            try:
-                from ..client import WebSocketCommandClient
-                async with WebSocketCommandClient(manager_uri) as client:
-                    stats = await client.send_command(device_id="system", command={"action": "get_info"}, expect_response=True)
-            except Exception as e:
-                print(f"Unable to contact manager at {manager_uri}: {e}")
-                stats = {}
-        else:
-            print("manager does not exist and no manager_uri provided")
-            stats = {}
-    else:
-        # manager is in same process; run coroutine to get stats in this thread's event loop
+    async def async_main():
+        client = WebSocketCommandClient(manager_uri)
+
+        async def get_stats():
+            return await client.send_command(device_id="system", command={"action": "get_info"}, expect_response=True)
+
         try:
-            stats = await manager.get_system_stats()
-        except Exception as e:
-            print(f"Error obtaining system stats: {e}")
-            stats = {}
+            stats = await get_stats()
+            heartbeat = stats.get("uptime_seconds", "N/A") if isinstance(stats, dict) else "N/A"
+        except Exception:
+            heartbeat = "N/A"
 
-    heartbeat = stats.get("uptime_seconds", "N/A") if isinstance(stats, dict) else "N/A"
+        window = QWidget()
+        window.setWindowTitle("HydroWire Basic GUI")
+        layout = QVBoxLayout(window)
+        label = QLabel(f"{heartbeat}")
+        label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(label)
+        window.setLayout(layout)
+        window.resize(300, 200)
+        window.show()
 
-    window = QWidget()
-    window.setWindowTitle("HydroWire Basic GUI")
-    layout = QVBoxLayout(window)
-    label = QLabel(f"{heartbeat}")
-    label.setAlignment(Qt.AlignCenter)
-    layout.addWidget(label)
-    window.setLayout(layout)
-    window.resize(300, 200)
-    window.show()
+        async def updater():
+            while True:
+                try:
+                    stats = await get_stats()
+                    hb = stats.get("uptime_seconds", "N/A") if isinstance(stats, dict) else "N/A"
+                    label.setText(f"{hb}")
+                except Exception as e:
+                    print(f"GUI update error: {e}")
+                await asyncio.sleep(interval / 1000.0)
 
-    if own_app:
-        return app.exec()
-    return 0
+        task = asyncio.create_task(updater())
+
+        # Wait until the QApplication is about to quit
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+
+        def _on_quit():
+            if not future.done():
+                future.set_result(None)
+
+        app.aboutToQuit.connect(_on_quit)
+
+        try:
+            await future
+        finally:
+            task.cancel()
+            try:
+                await task
+            except Exception:
+                pass
+            try:
+                await client.close()
+            except Exception:
+                pass
+
+    loop = QEventLoop(app)
+    asyncio.set_event_loop(loop)
+    with loop:
+        loop.run_until_complete(async_main())
+
 
 def stop_basic_gui():
     app = QApplication.instance()
@@ -58,9 +91,6 @@ def stop_basic_gui():
         return False
     try:
         # Post a quit request to the application's thread so it exits cleanly.
-        # Using QMetaObject.invokeMethod with QueuedConnection ensures the
-        # call is executed in the GUI thread even when invoked from another
-        # thread.
         from PySide6.QtCore import QMetaObject, Qt
         QMetaObject.invokeMethod(app, "quit", Qt.QueuedConnection)
     except Exception:
@@ -73,6 +103,6 @@ def stop_basic_gui():
             return False
     return True
 
+
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(run_basic_gui())
+    run_basic_gui()
