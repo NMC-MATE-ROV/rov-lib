@@ -1,7 +1,20 @@
 """HydroWire Manager - Main entry point for library initialization and control."""
 import asyncio
+import inspect
 from typing import Optional, Dict, Any, Callable
 from .client import WebSocketCommandClient
+
+
+def _process_run_callable(callable_obj, kwargs):
+    """Helper run in child process to execute GUI callable (coroutine or regular)."""
+    import asyncio as _asyncio, inspect as _inspect
+    try:
+        if _inspect.iscoroutinefunction(callable_obj):
+            _asyncio.run(callable_obj(**kwargs))
+        else:
+            callable_obj(**kwargs)
+    except Exception as e:
+        print(f"GUI process raised: {e}")
 
 
 class HydroWireManager:
@@ -29,6 +42,9 @@ class HydroWireManager:
         """Initialize connection to devices."""
         self.client = WebSocketCommandClient(self.uri, timeout=self.timeout)
         await self.client.connect()
+        # capture the event loop this manager runs on so other threads (e.g., GUI threads)
+        # can schedule manager coroutines back onto this loop safely.
+        self._loop = asyncio.get_running_loop()
         self._running = True
         print(f"HydroWire Manager initialized. Connected to {self.uri}")
 
@@ -80,40 +96,68 @@ class HydroWireManager:
         hydrowire.gui.basic_gui.run_basic_gui is used and its stop function
         will be used automatically.
         """
+        # Ensure module-level convenience getter returns this instance when
+        # an instance's start() is used directly (not via the module-level start()).
+        global _manager
+        _manager = self
+
         await self.initialize()
         if gui_enabled:
             await self._start_gui(gui_callable=gui_callable, gui_stop_callable=gui_stop_callable, **gui_config)
 
     async def _start_gui(self, gui_callable: Optional[Callable] = None, gui_stop_callable: Optional[Callable] = None, **config) -> None:
-        """Start GUI in a separate process so it doesn't interfere with the asyncio loop or Qt's
-        requirement that GUI objects live in a single native thread.
+        """Start GUI in a separate process so it doesn't interfere with the asyncio loop.
 
-        Stores references to the process and stop callable to allow graceful
+        Qt requires GUI objects to live in a single native thread (typically the
+        process's main thread). Creating QApplication inside a background thread
+        can cause undefined behavior and crashes. Running the GUI in a child
+        process isolates it and prevents segmentation faults on shutdown.
+
+        Stores references to the process and a stop callable to allow graceful
         shutdown in close().
         """
-        import multiprocessing
+        import multiprocessing, inspect, functools, signal, time
 
         stop_callable = gui_stop_callable
 
         if gui_callable is None:
             try:
-                from .gui.basic_gui import run_basic_gui, stop_basic_gui
+                from .gui.basic_gui import run_basic_gui
                 gui_callable = run_basic_gui
-                stop_callable = stop_basic_gui
+                # No safe cross-process stop function available by default
+                stop_callable = None
             except Exception as e:
                 print(f"Unable to import basic GUI: {e}. Skipping GUI startup.")
                 return
 
-        # Run the GUI callable directly in the child process. Passing a
-        # nested function as the Process target causes pickling errors on
-        # platforms using the 'spawn' start method (e.g., Windows). Use the
-        # top-level callable or pass kwargs directly instead.
-        process = multiprocessing.Process(target=gui_callable, kwargs=config, daemon=True)
-        process.start()
+        # Run the GUI callable in a separate process so QApplication is created
+        # in that process's main thread (avoids Qt crash on shutdown).
+        # Pass the manager URI into the child's kwargs so the GUI process can
+        # connect directly when the manager object isn't available across processes.
+        new_config = dict(config or {})
+        new_config.setdefault("manager_uri", getattr(self, "uri", None))
+        proc = multiprocessing.Process(target=_process_run_callable, args=(gui_callable, new_config), daemon=True)
+        proc.start()
 
-        # store references for shutdown
-        self._gui_process = process
-        self._gui_stop_callable = stop_callable
+        # Provide a stop callable that attempts graceful termination of the child
+        # process. This is process-local; it cannot call functions inside the
+        # child, but it's a reasonable fallback when no explicit cross-process
+        # stop callable is provided.
+        def _stop_proc():
+            try:
+                if not proc.is_alive():
+                    return True
+                # Try a gentle terminate first
+                proc.terminate()
+                # Give it a short moment to exit
+                proc.join(2)
+                return not proc.is_alive()
+            except Exception:
+                return False
+
+        self._gui_process = proc
+        # prefer user-provided stop callable if it exists and we're running in same process
+        self._gui_stop_callable = stop_callable or _stop_proc
 
     async def run(self, gui_enabled: bool = False, gui_callable: Optional[Callable] = None, gui_stop_callable: Optional[Callable] = None, **gui_config) -> None:
         try:
@@ -128,49 +172,79 @@ class HydroWireManager:
     async def close(self) -> None:
         """Close connection and attempt graceful GUI shutdown if present."""
         # Attempt to stop GUI first so app loop exits cleanly
-        if hasattr(self, "_gui_stop_callable") and self._gui_stop_callable:
-            try:
+        try:
+            if hasattr(self, "_gui_stop_callable") and self._gui_stop_callable:
                 stopped = False
                 try:
-                    stopped = self._gui_stop_callable()
-                except TypeError:
-                    # If stop callable is async or requires await, run it in event loop
+                    result = self._gui_stop_callable()
+                    # If the callable returned an awaitable (async function), await it
+                    if asyncio.iscoroutine(result) or hasattr(result, "__await__"):
+                        try:
+                            await result
+                            stopped = True
+                        except Exception:
+                            stopped = False
+                    else:
+                        try:
+                            stopped = bool(result)
+                        except Exception:
+                            stopped = False
+                except Exception:
+                    # If calling the stop callable raised, attempt to await it in case it's async
                     try:
                         await self._gui_stop_callable()
                         stopped = True
                     except Exception:
                         stopped = False
 
-                if stopped:
-                    # join the process (with timeout) to wait for it to exit
-                    if hasattr(self, "_gui_process") and self._gui_process is not None:
-                        try:
-                            await asyncio.to_thread(self._gui_process.join, 5)
-                        except Exception as e:
-                            print(f"Error joining GUI process: {e}")
-                else:
-                    # If the stop callable didn't stop the GUI, attempt to terminate the process
-                    if hasattr(self, "_gui_process") and self._gui_process is not None:
-                        try:
-                            self._gui_process.terminate()
-                            await asyncio.to_thread(self._gui_process.join, 5)
-                        except Exception as e:
-                            print(f"Error terminating GUI process: {e}")
-            except Exception as e:
-                print(f"Error while stopping GUI: {e}")
-
-        # If we have a process but no stop callable, try terminating it directly
-        elif hasattr(self, "_gui_process") and self._gui_process is not None:
-            try:
-                self._gui_process.terminate()
-                await asyncio.to_thread(self._gui_process.join, 5)
-            except Exception as e:
-                print(f"Error terminating GUI process: {e}")
+                # If a child process was used for the GUI, join it
+                if hasattr(self, "_gui_process") and self._gui_process is not None:
+                    try:
+                        await asyncio.to_thread(self._gui_process.join, 5)
+                    except Exception as e:
+                        print(f"Error joining GUI process: {e}")
+            # If we have a GUI process but no stop callable, try joining it directly
+            elif hasattr(self, "_gui_process") and self._gui_process is not None:
+                try:
+                    await asyncio.to_thread(self._gui_process.join, 5)
+                except Exception as e:
+                    print(f"Error joining GUI process: {e}")
+        except Exception as e:
+            print(f"Error while stopping GUI: {e}")
 
         if self.client:
             await self.client.close()
         self._running = False
         print("HydroWire Manager closed")
+
+    async def get_system_stats(self) -> Dict[str, Any]:
+        """Retrieve system stats.
+
+        If called from a different event loop (for example, a GUI running in a
+        separate thread), schedule the underlying send_command coroutine on the
+        manager's original loop to avoid "Future attached to a different loop"
+        errors from objects (like websocket transports) tied to that loop.
+        """
+        coro = self.send_command(
+            device_id="system",
+            command={"action": "get_info"},
+            expect_response=True,
+        )
+
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop in caller; just await the coroutine (will use manager loop)
+            return await coro
+
+        mgr_loop = getattr(self, "_loop", None)
+        # If manager loop is unknown or caller is running on the same loop, await directly
+        if mgr_loop is None or mgr_loop is current_loop:
+            return await coro
+
+        # Schedule coroutine on the manager's loop and await the concurrent future
+        cfut = asyncio.run_coroutine_threadsafe(coro, mgr_loop)
+        return await asyncio.wrap_future(cfut, loop=current_loop)
 
 
 _manager: Optional[HydroWireManager] = None
@@ -185,4 +259,3 @@ async def start(uri: str, gui_enabled: bool = False, gui_callable: Optional[Call
 
 async def get_manager() -> Optional[HydroWireManager]:
     return _manager
-
